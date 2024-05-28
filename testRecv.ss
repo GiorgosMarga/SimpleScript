@@ -1,0 +1,2 @@
+RCV 0 "Hello"
+PRN "RECEIVED"
