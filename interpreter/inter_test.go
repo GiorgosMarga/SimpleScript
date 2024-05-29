@@ -1,4 +1,4 @@
-package intre
+package interpreter
 
 import (
 	"bytes"

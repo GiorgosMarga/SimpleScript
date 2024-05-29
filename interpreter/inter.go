@@ -1,4 +1,4 @@
-package intre
+package interpreter
 
 // TODO: add groupid
 import (
@@ -29,7 +29,7 @@ const (
 	Ret = "RET"
 )
 
-type Intrepreter struct {
+type Interpreter struct {
 	killChan     chan struct{}
 	instructions [][]byte
 	ctr          int
@@ -40,11 +40,12 @@ type Intrepreter struct {
 	numOfInstr   int
 	groupid      int
 	groupChans   map[int]chan []byte
+	fileSize     int
 }
 
-func NewIntrepreter(threadId int, progName string, killChan chan struct{}, groupChans map[int]chan []byte) *Intrepreter {
-	return &Intrepreter{
-		ctr:        0,
+func NewInterpreter(threadId int, progName string, killChan chan struct{}, groupChans map[int]chan []byte, ctr int) *Interpreter {
+	return &Interpreter{
+		ctr:        ctr,
 		variables:  make(map[string]string),
 		threadId:   threadId,
 		progName:   progName,
@@ -53,7 +54,7 @@ func NewIntrepreter(threadId int, progName string, killChan chan struct{}, group
 	}
 }
 
-func (i *Intrepreter) ReadInstructions(f io.Reader, args []string) error {
+func (i *Interpreter) ReadInstructions(f io.Reader, args []string) error {
 	instr, err := io.ReadAll(f)
 	if err != nil {
 		return err
@@ -69,6 +70,7 @@ func (i *Intrepreter) ReadInstructions(f io.Reader, args []string) error {
 	i.instructions = splitted
 	for ctr, line := range splitted {
 		i.numOfInstr++
+		i.fileSize += len(line)
 		if len(line) == 0 {
 			continue
 		}
@@ -79,14 +81,14 @@ func (i *Intrepreter) ReadInstructions(f io.Reader, args []string) error {
 	}
 	return nil
 }
-func (i *Intrepreter) Run() error {
+func (i *Interpreter) Run() error {
 	for i.ctr < i.numOfInstr {
 		select {
 		case <-i.killChan:
 			fmt.Printf("[groupid: %d, threadID: %d, progName: %s] > Received termination signal\n", i.groupid, i.threadId, i.progName)
 			return ErrSignalKilled
 		default:
-			if err := i.ReadLine(); err != nil {
+			if err := i.readLine(); err != nil {
 				fmt.Printf("[groupid: %d, threadID: %d, progName: %s] > Error: %s\n", i.groupid, i.threadId, i.progName, err.Error())
 				return err
 			}
@@ -95,7 +97,7 @@ func (i *Intrepreter) Run() error {
 	return nil
 }
 
-func (i *Intrepreter) ReadLine() error {
+func (i *Interpreter) readLine() error {
 	line := i.instructions[i.ctr]
 	line = bytes.TrimSpace(line)
 
@@ -127,7 +129,7 @@ func (i *Intrepreter) ReadLine() error {
 	}
 	return nil
 }
-func (i *Intrepreter) HandleSndRcv(tokens [][]byte) error {
+func (i *Interpreter) HandleSndRcv(tokens [][]byte) error {
 	// Split in the correct way, so strings can contain spaces
 	jnd := bytes.Join(tokens, []byte{' '})
 	tokens = bytes.SplitN(jnd, []byte{' '}, 3)
@@ -168,17 +170,13 @@ func (i *Intrepreter) HandleSndRcv(tokens [][]byte) error {
 	id, _ := strconv.Atoi(val1)
 	if bytes.Equal(tokens[0], []byte(Snd)) {
 		i.groupChans[id] <- []byte(val2)
-		// fmt.Printf("[threadID: %d, progName: %s] > SND TO: %s val: %s\n", i.threadId, i.progName, val1, string(val2))
-
 	} else {
 		<-i.groupChans[id]
-		// fmt.Printf("[threadID: %d, progName: %s] > RCV FROM: %s val: %s\n", i.threadId, i.progName, val1, string(v))
-
 	}
 
 	return nil
 }
-func (i *Intrepreter) HandleSleep(tokens [][]byte) error {
+func (i *Interpreter) HandleSleep(tokens [][]byte) error {
 	if len(tokens) != 2 {
 		return fmt.Errorf("%w line: %d: expected SLP ValVarI\nGot %s", ErrInvalidInstruction, i.ctr, tokens)
 	}
@@ -200,7 +198,10 @@ func (i *Intrepreter) HandleSleep(tokens [][]byte) error {
 	time.Sleep(time.Duration(d) * time.Second)
 	return nil
 }
-func (i *Intrepreter) HandlePrint(tokens [][]byte) error {
+func (i *Interpreter) HandlePrint(tokens [][]byte) error {
+	jnd := bytes.Join(tokens, []byte{' '})
+	tokens = bytes.SplitN(jnd, []byte{' '}, 2)
+
 	if len(tokens) != 2 {
 		return fmt.Errorf("%w line: %d: expected PRN VarVal\nGot %s", ErrInvalidInstruction, i.ctr, tokens)
 	}
@@ -220,7 +221,7 @@ func (i *Intrepreter) HandlePrint(tokens [][]byte) error {
 	fmt.Printf("[threadID: %d, progName: %s] > %s\n", i.threadId, i.progName, val)
 	return nil
 }
-func (i *Intrepreter) HandleBranch(tokens [][]byte) error {
+func (i *Interpreter) HandleBranch(tokens [][]byte) error {
 	if len(tokens) != 2 {
 		return fmt.Errorf("%w line: %d: expected BRA Label\nGot %s", ErrInvalidInstruction, i.ctr, tokens)
 	}
@@ -234,7 +235,7 @@ func (i *Intrepreter) HandleBranch(tokens [][]byte) error {
 	i.ctr, _ = strconv.Atoi(val)
 	return nil
 }
-func (i *Intrepreter) HandleMathOperation(tokens [][]byte) error {
+func (i *Interpreter) HandleMathOperation(tokens [][]byte) error {
 	if len(tokens) != 4 {
 		return fmt.Errorf("%w line: %d: expected OPERATION VarName VarVal1 VarVal2\nGot %s", ErrInvalidInstruction, i.ctr, tokens)
 	}
@@ -299,7 +300,7 @@ func (i *Intrepreter) HandleMathOperation(tokens [][]byte) error {
 	return nil
 }
 
-func (i *Intrepreter) HandleBranchOperations(tokens [][]byte) error {
+func (i *Interpreter) HandleBranchOperations(tokens [][]byte) error {
 	if len(tokens) != 4 {
 		return fmt.Errorf("%w line: %d: expected OPERATION VarValI1 VarValI2 Label\nGot %s", ErrInvalidInstruction, i.ctr, tokens)
 	}
@@ -365,7 +366,7 @@ func (i *Intrepreter) HandleBranchOperations(tokens [][]byte) error {
 	i.ctr, _ = strconv.Atoi(val)
 	return nil
 }
-func (i *Intrepreter) HandleSet(tokens [][]byte) error {
+func (i *Interpreter) HandleSet(tokens [][]byte) error {
 	if len(tokens) != 3 {
 		return fmt.Errorf("%w line: %d: expected SET VarName VarVal\nGot %s", ErrInvalidInstruction, i.ctr, tokens)
 	}
@@ -392,6 +393,14 @@ func (i *Intrepreter) HandleSet(tokens [][]byte) error {
 	}
 	i.variables[string(varName)] = string(varVal)
 	return nil
+}
+
+func (i *Interpreter) GetPos() int {
+	return i.ctr
+}
+
+func (i *Interpreter) FileSize() int {
+	return i.fileSize
 }
 func isVarName(v []byte) bool {
 	return v[0] == '$'
