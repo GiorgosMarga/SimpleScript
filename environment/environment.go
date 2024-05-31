@@ -2,29 +2,27 @@ package environment
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/GiorgosMarga/simplescript/interpreter"
 	"github.com/GiorgosMarga/simplescript/server"
 )
 
-type Prog struct {
-	name        string
-	status      string
-	killChan    chan struct{}
-	interpreter *interpreter.Interpreter
-	id          int
-}
-
 type Environment struct {
 	s              *server.Server
-	threadsRunning map[int]*Prog
-	groupsRunning  map[int][]*Prog
+	threadsRunning map[int]*interpreter.Prog
+	groupsRunning  map[int][]*interpreter.Prog
 	scanner        *bufio.Scanner
 	id             int
 }
@@ -32,67 +30,78 @@ type Environment struct {
 func NewEnvironment(ipAddr, port string) *Environment {
 	return &Environment{
 		s:              server.NewServer(ipAddr, port),
-		threadsRunning: make(map[int]*Prog, 100),
-		groupsRunning:  make(map[int][]*Prog, 100),
+		threadsRunning: make(map[int]*interpreter.Prog, 100),
+		groupsRunning:  make(map[int][]*interpreter.Prog, 100),
 		scanner:        bufio.NewScanner(os.Stdin),
 		id:             0,
 	}
 }
 
-func (e *Environment) handleGroupExecution(cmd string) {
-	cmds := strings.Split(cmd[4:], " || ")
-	groupId := e.id
+func (e *Environment) handleGroupExecution(cmd string, groupId int) {
+	fmt.Println("Group execution for group", groupId)
+	cmds := strings.Split(cmd[4:], " || ") // skip 'run'
 	wg := &sync.WaitGroup{}
-	e.groupsRunning[groupId] = make([]*Prog, len(cmds))
+	e.groupsRunning[groupId] = make([]*interpreter.Prog, len(cmds))
 	groupChans := make(map[int]chan []byte, len(cmds))
 	for i := 0; i < len(cmds); i++ {
 		groupChans[i] = make(chan []byte)
 	}
 	for n, cmd := range cmds {
 		t := strings.Split(cmd, " ")
-		args := make([]string, 0, 10)
-		for i := 1; i < len(t); i++ {
-			args = append(args, t[i])
-		}
-		p := &Prog{
-			name:     t[0],
-			status:   "RUNNING",
-			killChan: make(chan struct{}),
-			id:       n,
-		}
-		e.groupsRunning[groupId][n] = p
-
 		wg.Add(1)
-		go func(p *Prog, args []string, killChan chan struct{}, groupChan map[int]chan []byte) {
-			f, err := os.Open(p.name)
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-			defer func() {
-				f.Close()
-				wg.Done()
-			}()
-			inter := interpreter.NewInterpreter(p.id, p.name, killChan, groupChan, 0)
-			inter.ReadInstructions(f, args)
-			p.interpreter = inter
-			if err := inter.Run(); err != nil {
-				if errors.Is(err, interpreter.ErrSignalKilled) {
-					e.groupsRunning[groupId][p.id].status = "KILLED"
-					return
+		go func(grpid, id int) {
+			if err := e.runScript(t, 0, id, grpid, groupChans); err != nil {
+				if !errors.Is(err, interpreter.ErrSignalKilled) {
+					fmt.Println(err, "Killing all members....")
+					time.Sleep(100 * time.Millisecond)
+					e.killGroup(groupId)
 				}
-				// unexpected error, should terminate all the other memebers of the group
-				e.groupsRunning[groupId][p.id].status = "ERROR:" + err.Error()
-				if err := e.killGroup(groupId); err != nil {
-					fmt.Println(err)
-				}
-				return
 			}
-			e.groupsRunning[groupId][p.id].status = "FINISHED"
-
-		}(p, args, p.killChan, groupChans)
+			wg.Done()
+		}(groupId, n)
 	}
 	wg.Wait()
+}
+
+// TODO: add mtx
+func (e *Environment) runScript(t []string, startingPos, id, grpid int, grpChans map[int]chan []byte) error {
+	args := make([]string, 0, 10)
+	for i := 0; i < len(t); i++ {
+		args = append(args, t[i])
+	}
+	p := &interpreter.Prog{
+		Name:     t[0],
+		Status:   "RUNNING",
+		Id:       id,
+		KillChan: make(chan struct{}),
+	}
+	if grpid > -1 {
+		e.groupsRunning[grpid][id] = p
+	} else {
+		e.threadsRunning[id] = p
+	}
+	f, err := os.Open(p.Name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	inter := interpreter.NewInterpreter(p, grpChans, startingPos)
+	inter.ReadInstructions(f, args)
+	p.Interpreter = inter
+	if err := inter.Run(); err != nil {
+		if errors.Is(err, interpreter.ErrSignalKilled) {
+			e.threadsRunning[p.Id].Status = "KILLED"
+			return err
+		}
+		e.threadsRunning[p.Id].Status = "ERROR:" + err.Error()
+		return err
+	}
+	if grpid > -1 {
+		e.groupsRunning[grpid][id].Status = "FINISHED"
+	} else {
+		e.threadsRunning[p.Id].Status = "FINISHED"
+	}
+	return nil
 }
 func (e *Environment) killGroup(id int) error {
 	ps, ok := e.groupsRunning[id]
@@ -101,19 +110,24 @@ func (e *Environment) killGroup(id int) error {
 	}
 
 	for _, p := range ps {
-		p.killChan <- struct{}{}
+		p.KillChan <- struct{}{}
 	}
 	return nil
 }
 func (e *Environment) Start() error {
+	go func() {
+		log.Fatal(e.s.ListenAndAccept())
+	}()
+
+	dirName := fmt.Sprintf(".%s%s", e.s.IpAddr, e.s.Port)
+	if _, err := os.Stat(dirName); os.IsNotExist(err) {
+		if err := os.Mkdir(dirName, os.ModePerm); err != nil {
+			log.Fatal(err)
+		}
+	}
+
 scanLoop:
 	for e.scanner.Scan() {
-		if strings.Contains(e.scanner.Text(), "||") {
-			e.id++
-
-			go e.handleGroupExecution(e.scanner.Text())
-			continue
-		}
 		t := strings.Split(e.scanner.Text(), " ")
 		switch {
 		case t[0] == "exit":
@@ -128,16 +142,16 @@ scanLoop:
 			gid, _ := strconv.Atoi(grpID)
 			tid, _ := strconv.Atoi(threadId)
 			p := e.groupsRunning[gid][tid]
-			e.s.Migrate(ipAddr, port, p.name, p.interpreter)
-			e.groupsRunning[gid][tid].status = "MIGRATED TO" + ipAddr + port
+			e.s.Migrate(ipAddr, port, p)
+			e.groupsRunning[gid][tid].Status = "MIGRATED TO" + ipAddr + port
 		case t[0] == "list":
 			for id, p := range e.threadsRunning {
-				fmt.Printf("> threadID: %d\tprogname: %s\tstatus: %s\n", id, p.name, p.status)
+				fmt.Printf("> threadID: %d\tName: %s\tstatus: %s\n", id, p.Name, p.Status)
 			}
-			for id, progs := range e.groupsRunning {
+			for id, interpreters := range e.groupsRunning {
 				fmt.Printf("> Groupid: %d\n", id)
-				for n, p := range progs {
-					fmt.Printf("\tthreadID: %d\tprogname: %s\tstatus: %s\n", n, p.name, p.status)
+				for n, p := range interpreters {
+					fmt.Printf("\tthreadID: %d\tName: %s\tstatus: %s\n", n, p.Name, p.Status)
 				}
 			}
 			fmt.Println()
@@ -149,7 +163,7 @@ scanLoop:
 			}
 			p, ok := e.threadsRunning[id]
 			if ok {
-				p.killChan <- struct{}{}
+				p.KillChan <- struct{}{}
 				continue
 			}
 			_, ok = e.groupsRunning[id]
@@ -159,36 +173,18 @@ scanLoop:
 			}
 			fmt.Printf("Thread: [%d] doesn't exist or is not running\n", id)
 		case t[0] == "run":
-			args := make([]string, 0, 10)
-			for i := 2; i < len(t); i++ {
-				args = append(args, t[i])
+			for i := 1; i < len(t); i++ {
+				if t[i] == "||" {
+					go e.handleGroupExecution(strings.Join(t, " "), e.id)
+					e.id++
+					continue scanLoop
+				}
 			}
-			p := &Prog{
-				name:   t[1],
-				status: "RUNNING",
-			}
-			e.threadsRunning[e.id] = p
-			p.killChan = make(chan struct{})
-			go func(id int, progname string, args []string, killChan chan struct{}) {
-				f, err := os.Open(progname)
-				if err != nil {
+			go func() {
+				if err := e.runScript(t[1:], 0, e.id, -1, nil); err != nil {
 					fmt.Println(err)
-					return
 				}
-				defer f.Close()
-				inter := interpreter.NewInterpreter(id, progname, killChan, nil, 0)
-				inter.ReadInstructions(f, args)
-				if err := inter.Run(); err != nil {
-					if errors.Is(err, interpreter.ErrSignalKilled) {
-						e.threadsRunning[id].status = "KILLED"
-						return
-					}
-					e.threadsRunning[id].status = "ERROR:" + err.Error()
-					return
-				}
-				e.threadsRunning[id].status = "FINISHED"
-			}(e.id, t[1], args, p.killChan)
-			e.id++
+			}()
 		default:
 			fmt.Println("Unknown command:", e.scanner.Text())
 		}
@@ -197,4 +193,45 @@ scanLoop:
 		return err
 	}
 	return nil
+}
+
+// TODO: ipaddr+port
+func (e *Environment) Migrate(ipAddr, port string, p *interpreter.Prog) error {
+	conn, err := net.Dial("tcp", port)
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+	f, err := os.Open(p.Name)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	b, _ := io.ReadAll(f)
+	st, _ := f.Stat()
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, int64(len(p.Name)))
+	binary.Write(buf, binary.LittleEndian, []byte(p.Name))
+	binary.Write(buf, binary.LittleEndian, st.Size())
+	binary.Write(buf, binary.LittleEndian, b)
+	binary.Write(buf, binary.LittleEndian, int64(p.Interpreter.GetPos()))
+
+	binary.Write(buf, binary.LittleEndian, int64(len(p.Interpreter.Variables)))
+	_, err = conn.Write(buf.Bytes())
+	buf.Reset()
+	for varName, varVal := range p.Interpreter.Variables {
+		binary.Write(buf, binary.LittleEndian, int64(len(varName)))
+		binary.Write(buf, binary.LittleEndian, []byte(varName))
+		binary.Write(buf, binary.LittleEndian, int64(len(varVal)))
+		binary.Write(buf, binary.LittleEndian, []byte(varVal))
+	}
+	_, err = conn.Write(buf.Bytes())
+
+	if err != nil {
+		return err
+	}
+	// fmt.Printf("[%s]: wrote (%d) bytes to %s\n", s.port, n, conn.RemoteAddr())
+	go e.s.HandleConn(conn)
+	return nil
+
 }
