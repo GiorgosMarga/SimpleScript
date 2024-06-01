@@ -35,3 +35,8 @@ ring.txt
 
 Example for a ring of 3 threads and 5 iterations:
 run ring.ss 0 1 2 5 1 || ring.ss 1 2 0 5 1 || ring.ss 2 0 1 5 1
+
+
+4) 
+    run multiply_m.ss 10 20 || multiply_m.ss 10 20
+    migrate 0 0 0 :3002

@@ -73,7 +73,7 @@ func (i *Interpreter) ReadInstructions(f io.Reader, args []string) error {
 	}
 
 	splitted := bytes.Split(instr, []byte{'\n'})
-
+	i.Variables["$argc"] = strconv.Itoa(len(args))
 	i.Instructions = splitted
 	for ctr, line := range splitted {
 		line := bytes.TrimSpace(line)
@@ -232,7 +232,11 @@ func (i *Interpreter) HandleSleep(tokens [][]byte) error {
 		}
 		sleepVal = val
 	}
+	fmt.Println("Sleep val is", sleepVal)
 	d, _ := strconv.Atoi(sleepVal)
+	fmt.Println("Sleep val is", d)
+
+	fmt.Println("Sleeping for ", time.Duration(d)*time.Second)
 	time.Sleep(time.Duration(d) * time.Second)
 	return nil
 }

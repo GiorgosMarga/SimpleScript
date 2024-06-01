@@ -13,16 +13,18 @@ import (
 const StreamByte = byte(0)
 
 type Server struct {
-	IpAddr string
-	Port   string
-	ln     net.Listener
-	peers  []net.Conn
+	IpAddr  string
+	Port    string
+	ln      net.Listener
+	peers   []net.Conn
+	EnvChan chan *interpreter.Prog
 }
 
 func NewServer(ipAddr, port string) *Server {
 	return &Server{
-		IpAddr: ipAddr,
-		Port:   port,
+		IpAddr:  ipAddr,
+		Port:    port,
+		EnvChan: make(chan *interpreter.Prog),
 	}
 }
 
@@ -46,12 +48,11 @@ func (s *Server) ListenAndAccept() error {
 func (s *Server) Migrate(ipAddr, port string, p *interpreter.Prog) error {
 
 	fmt.Println("Migrating to", ipAddr+port)
-	conn, err := net.Dial("tcp", port)
+	conn, err := net.Dial("tcp", ipAddr+port)
 	if err != nil {
 		fmt.Println(err)
 		return err
 	}
-	fmt.Println(p.Interpreter)
 	if err := gob.NewEncoder(conn).Encode(p); err != nil {
 		return err
 	}
@@ -65,12 +66,11 @@ func (s *Server) HandleConn(conn net.Conn) error {
 		p := &interpreter.Prog{}
 		if err := gob.NewDecoder(conn).Decode(p); err != nil {
 			if errors.Is(err, io.EOF) {
-				fmt.Println("Connection Closed")
 				return err
 			}
 			fmt.Printf("Wrong: %s", err)
 			continue
 		}
-		fmt.Printf("%+v\n", p.Interpreter)
+		s.EnvChan <- p
 	}
 }

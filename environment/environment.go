@@ -114,10 +114,19 @@ func (e *Environment) killGroup(id int) error {
 	}
 	return nil
 }
+func (e *Environment) handleMigrations() error {
+	for p := range e.s.EnvChan {
+		inter := p.Interpreter
+		fmt.Printf("Resuming %s execution\n", p.Name)
+		go inter.Run()
+	}
+	return nil
+}
 func (e *Environment) Start() error {
 	go func() {
 		log.Fatal(e.s.ListenAndAccept())
 	}()
+	go e.handleMigrations()
 
 	dirName := fmt.Sprintf(".%s%s", e.s.IpAddr, e.s.Port)
 	if _, err := os.Stat(dirName); os.IsNotExist(err) {
