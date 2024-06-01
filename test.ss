@@ -1,5 +1,5 @@
-SET $val1 10
-SET $val2 2000000000
+SET $val1 0
+SET $val2 100
 
 #Label1:
     ADD $val1 $val1 1
