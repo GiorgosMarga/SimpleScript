@@ -3,11 +3,15 @@ package interpreter
 // TODO: add Groupid
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/GiorgosMarga/simplescript/msgs"
 )
 
 const (
@@ -31,33 +35,51 @@ const (
 )
 
 type Prog struct {
-	Name        string
-	Status      string
-	KillChan    chan struct{}
-	Interpreter *Interpreter
-	Id          int
+	Name     string
+	Status   string
+	killChan chan struct{}
+	ThreadId int
+	GroupId  int
 }
 type Interpreter struct {
-	killChan     chan struct{}
 	Instructions [][]byte
 	Ctr          int
 	Variables    map[string]string
 	Argc         int
-	ThreadId     int
-	ProgName     string
 	NumOfInstr   int
-	Groupid      int
 	groupChans   map[int]chan []byte
+	Program      *Prog
+	SleepUntil   time.Time
+	MsgChan      chan *msgs.Msg
+	MigratedFrom string
+	Conn         net.Conn
 }
 
-func NewInterpreter(p *Prog, groupChans map[int]chan []byte, Ctr int) *Interpreter {
+func NewProg(name string, threadid int) *Prog {
+	return &Prog{
+		Name:     name,
+		Status:   "RUNNING",
+		ThreadId: threadid,
+		killChan: make(chan struct{}),
+	}
+}
+
+func (p *Prog) KillProg(status string) {
+	if p.Status != "RUNNING" {
+		return
+	}
+	fmt.Printf("Sending termination signal to %s (%d)\n", p.Name, p.ThreadId)
+	p.killChan <- struct{}{}
+	p.Status = status
+}
+func NewInterpreter(p *Prog, groupChans map[int]chan []byte, Ctr int, msgChan chan *msgs.Msg) *Interpreter {
 	return &Interpreter{
 		Ctr:        Ctr,
 		Variables:  make(map[string]string),
-		ThreadId:   p.Id,
-		ProgName:   p.Name,
-		killChan:   p.KillChan,
+		Program:    p,
 		groupChans: groupChans,
+		SleepUntil: time.Now(),
+		MsgChan:    msgChan,
 	}
 }
 
@@ -90,12 +112,14 @@ func (i *Interpreter) ReadInstructions(f io.Reader, args []string) error {
 func (i *Interpreter) Run() error {
 	for i.Ctr < i.NumOfInstr {
 		select {
-		case <-i.killChan:
-			fmt.Printf("[Groupid: %d, threadID: %d, ProgName: %s] > Received termination signal\n", i.Groupid, i.ThreadId, i.ProgName)
+		case <-i.Program.killChan:
+			fmt.Printf("[Groupid: %d, threadID: %d, ProgName: %s] > Received termination signal\n", i.Program.GroupId, i.Program.ThreadId, i.Program.Name)
 			return ErrSignalKilled
 		default:
 			if err := i.readLine(); err != nil {
-				fmt.Printf("[Groupid: %d, threadID: %d, ProgName: %s] > Error: %s\n", i.Groupid, i.ThreadId, i.ProgName, err.Error())
+				if !errors.Is(err, ErrSignalKilled) {
+					fmt.Printf("[Groupid: %d, threadID: %d, ProgName: %s] > Error: %s\n", i.Program.GroupId, i.Program.ThreadId, i.Program.Name, err.Error())
+				}
 				return err
 			}
 		}
@@ -135,7 +159,6 @@ func (i *Interpreter) readLine() error {
 		return i.HandleRcv(tkns)
 	case bytes.Equal(tkns[0], []byte(Ret)):
 		i.Ctr = i.NumOfInstr // for loop in run() stops
-		break
 	default:
 		i.Ctr++
 	}
@@ -170,9 +193,15 @@ func (i *Interpreter) HandleRcv(tokens [][]byte) error {
 		}
 	}
 	id, _ := strconv.Atoi(val1)
-	data := <-i.groupChans[id]
-	i.Variables[val2] = string(data)
-	return nil
+	for {
+		select {
+		case data := <-i.groupChans[id]:
+			i.Variables[val2] = string(data)
+			return nil
+		case <-i.Program.killChan:
+			return ErrSignalKilled
+		}
+	}
 }
 func (i *Interpreter) HandleSnd(tokens [][]byte) error {
 	// Split in the correct way, so strings can contain spaces
@@ -208,8 +237,16 @@ func (i *Interpreter) HandleSnd(tokens [][]byte) error {
 			return fmt.Errorf("%w line: %d: undeclared variable: %s", ErrUndeclaredVariable, i.Ctr, string(tokens[2]))
 		}
 	}
-
 	id, _ := strconv.Atoi(val1)
+	if len(i.MigratedFrom) > 0 {
+		m := &msgs.Msg{
+			To:   id,
+			Val:  []byte(val2),
+			Conn: i.Conn,
+		}
+		i.MsgChan <- m
+		return nil
+	}
 	i.groupChans[id] <- []byte(val2)
 
 	return nil
@@ -232,13 +269,24 @@ func (i *Interpreter) HandleSleep(tokens [][]byte) error {
 		}
 		sleepVal = val
 	}
-	fmt.Println("Sleep val is", sleepVal)
 	d, _ := strconv.Atoi(sleepVal)
-	fmt.Println("Sleep val is", d)
-
-	fmt.Println("Sleeping for ", time.Duration(d)*time.Second)
-	time.Sleep(time.Duration(d) * time.Second)
-	return nil
+	var timer *time.Timer
+	if time.Now().Before(i.SleepUntil) {
+		timer = time.NewTimer(time.Duration(time.Until(i.SleepUntil).Seconds()) * time.Second)
+		i.SleepUntil = time.Now().Add(time.Duration(time.Until(i.SleepUntil).Seconds()) * time.Second)
+	} else {
+		timer = time.NewTimer(time.Duration(d) * time.Second)
+		i.SleepUntil = time.Now().Add(time.Duration(d) * time.Second)
+	}
+	fmt.Println("Sleeping for")
+	for {
+		select {
+		case <-timer.C:
+			return nil
+		case <-i.Program.killChan:
+			return ErrSignalKilled
+		}
+	}
 }
 
 func parseString(b []byte) (int, string) {
@@ -301,7 +349,7 @@ func (i *Interpreter) HandlePrint(tokens [][]byte) error {
 		strBldr.WriteString(str)
 		j += n
 	}
-	fmt.Printf("[threadID: %d, ProgName: %s] > %s\n", i.ThreadId, i.ProgName, strBldr.String())
+	fmt.Printf("[threadID: %d, ProgName: %s] > %s\n", i.Program.ThreadId, i.Program.Name, strBldr.String())
 	return nil
 }
 func (i *Interpreter) HandleBranch(tokens [][]byte) error {

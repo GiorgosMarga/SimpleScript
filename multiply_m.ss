@@ -15,8 +15,8 @@
      ADD $res $res $b
      PRN "intermediate result is " $res
      SUB $a $a 1
-     PRN "Sleeping for 200 secs"
-     SLP 200
+     PRN "Sleeping for 20 secs"
+     SLP 20
      BRA #L1
 
 #L2  
