@@ -15,6 +15,12 @@ import (
 )
 
 const (
+	Running = iota
+	Migrated
+	Killed
+)
+
+const (
 	Set = "SET"
 	Add = "ADD"
 	Sub = "SUB"
@@ -47,12 +53,13 @@ type Interpreter struct {
 	Variables    map[string]string
 	Argc         int
 	NumOfInstr   int
-	groupChans   map[int]chan []byte
+	groupChans   map[int]chan msgs.InterProcessMsg
 	Program      *Prog
 	SleepUntil   time.Time
 	MsgChan      chan *msgs.Msg
 	MigratedFrom string
 	Conn         net.Conn
+	threadsState map[int]int
 }
 
 func NewProg(name string, threadid int) *Prog {
@@ -72,14 +79,15 @@ func (p *Prog) KillProg(status string) {
 	p.killChan <- struct{}{}
 	p.Status = status
 }
-func NewInterpreter(p *Prog, groupChans map[int]chan []byte, Ctr int, msgChan chan *msgs.Msg) *Interpreter {
+func NewInterpreter(p *Prog, groupChans map[int]chan msgs.InterProcessMsg, Ctr int, msgChan chan *msgs.Msg, threadsState map[int]int) *Interpreter {
 	return &Interpreter{
-		Ctr:        Ctr,
-		Variables:  make(map[string]string),
-		Program:    p,
-		groupChans: groupChans,
-		SleepUntil: time.Now(),
-		MsgChan:    msgChan,
+		Ctr:          Ctr,
+		Variables:    make(map[string]string),
+		Program:      p,
+		groupChans:   groupChans,
+		SleepUntil:   time.Now(),
+		MsgChan:      msgChan,
+		threadsState: threadsState,
 	}
 }
 
@@ -196,7 +204,18 @@ func (i *Interpreter) HandleRcv(tokens [][]byte) error {
 	for {
 		select {
 		case data := <-i.groupChans[id]:
-			i.Variables[val2] = string(data)
+			i.Variables[val2] = string(data.Val)
+			if len(i.MigratedFrom) > 0 || i.threadsState[data.From] == Migrated {
+				m := &msgs.Msg{
+					ChanId:  data.From,
+					GroupId: i.Program.GroupId,
+					Conn:    i.Conn,
+					Val:     []byte{0x0},
+					From:    i.Program.ThreadId,
+				}
+				// ack that received msg
+				i.MsgChan <- m
+			}
 			return nil
 		case <-i.Program.killChan:
 			return ErrSignalKilled
@@ -238,16 +257,24 @@ func (i *Interpreter) HandleSnd(tokens [][]byte) error {
 		}
 	}
 	id, _ := strconv.Atoi(val1)
-	if len(i.MigratedFrom) > 0 {
+	if len(i.MigratedFrom) > 0 || i.threadsState[id] == Migrated {
 		m := &msgs.Msg{
-			To:   id,
-			Val:  []byte(val2),
-			Conn: i.Conn,
+			ChanId:  id,
+			GroupId: i.Program.GroupId,
+			Val:     []byte(val2),
+			Conn:    i.Conn,
+			From:    i.Program.ThreadId,
 		}
 		i.MsgChan <- m
+		// block here until other process rcv
+		<-i.groupChans[i.Program.ThreadId]
 		return nil
 	}
-	i.groupChans[id] <- []byte(val2)
+	msg := msgs.InterProcessMsg{
+		Val:  []byte(val2),
+		From: i.Program.ThreadId,
+	}
+	i.groupChans[id] <- msg
 
 	return nil
 }
@@ -278,7 +305,6 @@ func (i *Interpreter) HandleSleep(tokens [][]byte) error {
 		timer = time.NewTimer(time.Duration(d) * time.Second)
 		i.SleepUntil = time.Now().Add(time.Duration(d) * time.Second)
 	}
-	fmt.Println("Sleeping for")
 	for {
 		select {
 		case <-timer.C:
@@ -524,7 +550,9 @@ func (i *Interpreter) HandleSet(tokens [][]byte) error {
 	i.Variables[string(varName)] = string(varVal)
 	return nil
 }
-
+func (i *Interpreter) AddChan(groupChans map[int]chan msgs.InterProcessMsg) {
+	i.groupChans = groupChans
+}
 func (i *Interpreter) GetPos() int {
 	return i.Ctr
 }

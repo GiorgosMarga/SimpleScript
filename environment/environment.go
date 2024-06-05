@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -21,9 +22,16 @@ type Environment struct {
 	s              *server.Server
 	threadsRunning map[int]*interpreter.Interpreter
 	groupsRunning  map[int][]*interpreter.Interpreter
+	groupInfos     map[int]*GroupInfo
 	scanner        *bufio.Scanner
 	id             int
 	msgChan        chan *msgs.Msg
+}
+
+type GroupInfo struct {
+	groupChans   map[int]chan msgs.InterProcessMsg
+	threadsState map[int]int
+	threadToConn map[int]net.Conn
 }
 
 func NewEnvironment(ipAddr, port string) *Environment {
@@ -32,6 +40,7 @@ func NewEnvironment(ipAddr, port string) *Environment {
 		threadsRunning: make(map[int]*interpreter.Interpreter, 100),
 		groupsRunning:  make(map[int][]*interpreter.Interpreter, 100),
 		scanner:        bufio.NewScanner(os.Stdin),
+		groupInfos:     make(map[int]*GroupInfo),
 		id:             0,
 		msgChan:        make(chan *msgs.Msg),
 	}
@@ -42,15 +51,23 @@ func (e *Environment) handleGroupExecution(cmd string, groupId int) {
 	cmds := strings.Split(cmd[4:], " || ") // skip 'run'
 	wg := &sync.WaitGroup{}
 	e.groupsRunning[groupId] = make([]*interpreter.Interpreter, len(cmds))
-	groupChans := make(map[int]chan []byte, len(cmds))
+	groupChans := make(map[int]chan msgs.InterProcessMsg, len(cmds))
 	for i := 0; i < len(cmds); i++ {
-		groupChans[i] = make(chan []byte)
+		groupChans[i] = make(chan msgs.InterProcessMsg)
 	}
+
+	gi := &GroupInfo{
+		groupChans:   groupChans,
+		threadsState: make(map[int]int),
+		threadToConn: make(map[int]net.Conn),
+	}
+	e.groupInfos[groupId] = gi
 	for n, cmd := range cmds {
 		t := strings.Split(cmd, " ")
 		wg.Add(1)
-		go func(grpid, id int) {
-			if err := e.runScript(t, 0, id, grpid, groupChans); err != nil {
+		gi.threadsState[n] = interpreter.Running
+		go func(grpid, id int, threadsState map[int]int) {
+			if err := e.runScript(t, 0, id, grpid, groupChans, threadsState); err != nil {
 				if !errors.Is(err, interpreter.ErrSignalKilled) {
 					fmt.Println(err, "Killing all members....")
 					time.Sleep(100 * time.Millisecond)
@@ -58,14 +75,14 @@ func (e *Environment) handleGroupExecution(cmd string, groupId int) {
 				}
 			}
 			wg.Done()
-		}(groupId, n)
+		}(groupId, n, gi.threadsState)
 	}
 	wg.Wait()
 }
 
 // TODO: add mtx
 // TODO: handle list "killed", who should add this environment or script
-func (e *Environment) runScript(t []string, startingPos, id, grpid int, grpChans map[int]chan []byte) error {
+func (e *Environment) runScript(t []string, startingPos, id, grpid int, grpChans map[int]chan msgs.InterProcessMsg, groupInfo map[int]int) error {
 	args := make([]string, 0, 10)
 	for i := 0; i < len(t); i++ {
 		args = append(args, t[i])
@@ -76,7 +93,7 @@ func (e *Environment) runScript(t []string, startingPos, id, grpid int, grpChans
 		return err
 	}
 	defer f.Close()
-	inter := interpreter.NewInterpreter(p, grpChans, startingPos, e.msgChan)
+	inter := interpreter.NewInterpreter(p, grpChans, startingPos, e.msgChan, groupInfo)
 	if grpid > -1 {
 		e.groupsRunning[grpid][id] = inter
 	} else {
@@ -90,11 +107,7 @@ func (e *Environment) runScript(t []string, startingPos, id, grpid int, grpChans
 		e.threadsRunning[p.ThreadId].Program.Status = "ERROR:" + err.Error()
 		return err
 	}
-	if grpid > -1 {
-		e.groupsRunning[p.GroupId][p.ThreadId].Program.Status = "FINISHED"
-	} else {
-		e.threadsRunning[p.ThreadId].Program.Status = "FINISHED"
-	}
+	inter.Program.Status = "FINISHED"
 	return nil
 }
 func (e *Environment) killGroup(id int) error {
@@ -102,43 +115,75 @@ func (e *Environment) killGroup(id int) error {
 	if !ok {
 		return fmt.Errorf("group (%d) doesn't exist", id)
 	}
-
-	for _, inter := range inters {
+	gi := e.groupInfos[id]
+	for n, inter := range inters {
 		inter.Program.KillProg("KILLED")
+		gi.threadsState[n] = interpreter.Killed
 	}
 	return nil
 }
-func (e *Environment) handleMigrations() error {
-	for inter := range e.s.EnvChan {
-		if inter.Program.GroupId > -1 {
-			fmt.Println(e.groupsRunning[inter.Program.GroupId])
+func (e *Environment) handleMigrationMsg(inter *interpreter.Interpreter) error {
+	gid := inter.Program.GroupId
+	if gid > -1 {
+		var (
+			g  []*interpreter.Interpreter
+			ok bool
+		)
+		g, ok = e.groupsRunning[gid]
+		if !ok {
+			g = make([]*interpreter.Interpreter, 0)
 		}
-		fmt.Printf("Resuming %s execution\n", inter.Program.Name)
-		inter.MsgChan = e.msgChan
-		go inter.Run()
+		g = append(g, inter)
+		e.groupsRunning[gid] = g
 	}
+	fmt.Printf("Resuming %s execution\n", inter.Program.Name)
+	inter.MsgChan = e.msgChan
+	gi, ok := e.groupInfos[inter.Program.GroupId]
+	if !ok {
+		gi = &GroupInfo{
+			groupChans:   make(map[int]chan msgs.InterProcessMsg),
+			threadsState: make(map[int]int),
+		}
+		e.groupInfos[inter.Program.GroupId] = gi
+		gi.groupChans[inter.Program.ThreadId] = make(chan msgs.InterProcessMsg)
+	}
+	gi.threadsState[inter.Program.ThreadId] = interpreter.Migrated
+	inter.AddChan(gi.groupChans)
+	go func() {
+		if err := inter.Run(); err != nil {
+			fmt.Println(err)
+		}
+		inter.Program.Status = "FINISHED"
+	}()
 	return nil
 }
 
-type MsgForEncoding struct {
-	To  int
-	Val []byte
-}
-
-func (e *Environment) handleSndMsg() error {
-	for m := range e.msgChan {
-		m.Conn.Write([]byte{0x1})
-		msgForEncoding := MsgForEncoding{
-			To:  m.To,
-			Val: m.Val,
-		}
-		if err := gob.NewEncoder(m.Conn).Encode(msgForEncoding); err != nil {
-			fmt.Println("Sending sndMsg:", err)
-			continue
+func (e *Environment) handleMsgs() error {
+	for {
+		select {
+		case inter := <-e.s.MigrationChan:
+			if err := e.handleMigrationMsg(inter); err != nil {
+				return err
+			}
+		case m := <-e.msgChan:
+			if m.Conn == nil {
+				m.Conn = e.groupInfos[m.GroupId].threadToConn[m.ChanId]
+			}
+			if err := e.s.SendSndMsg(m); err != nil {
+				fmt.Println(err)
+				return err
+			}
+		case m := <-e.s.MsgChan:
+			gi := e.groupInfos[m.GroupId]
+			msg := msgs.InterProcessMsg{
+				Val:  m.Val,
+				From: m.From,
+			}
+			gi.groupChans[m.ChanId] <- msg
 		}
 	}
-	return nil
 }
+
 func init() {
 	gob.Register(msgs.Msg{})
 }
@@ -146,8 +191,7 @@ func (e *Environment) Start() error {
 	go func() {
 		log.Fatal(e.s.ListenAndAccept())
 	}()
-	go e.handleMigrations()
-	go e.handleSndMsg()
+	go e.handleMsgs()
 
 	dirName := fmt.Sprintf(".%s%s", e.s.IpAddr, e.s.Port)
 	if _, err := os.Stat(dirName); os.IsNotExist(err) {
@@ -172,10 +216,13 @@ scanLoop:
 			gid, _ := strconv.Atoi(grpID)
 			tid, _ := strconv.Atoi(threadId)
 			p := e.groupsRunning[gid][tid]
-			if err := e.s.Migrate(ipAddr, port, p); err != nil {
+			conn, err := e.s.Migrate(ipAddr, port, p)
+			if err != nil {
 				fmt.Println(err)
 				continue
 			}
+			e.groupInfos[gid].threadsState[tid] = interpreter.Migrated
+			e.groupInfos[gid].threadToConn[tid] = conn
 			p.Program.KillProg("MIGRATED TO " + ipAddr + port)
 		case t[0] == "list":
 			for id, p := range e.threadsRunning {
@@ -214,7 +261,7 @@ scanLoop:
 				}
 			}
 			go func() {
-				if err := e.runScript(t[1:], 0, e.id, -1, nil); err != nil {
+				if err := e.runScript(t[1:], 0, e.id, -1, nil, nil); err != nil {
 					fmt.Println(err)
 				}
 			}()
