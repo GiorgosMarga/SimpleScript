@@ -18,17 +18,19 @@ const (
 )
 
 type Server struct {
-	IpAddr  string
-	Port    string
-	ln      net.Listener
-	EnvChan chan *interpreter.Interpreter
+	IpAddr        string
+	Port          string
+	ln            net.Listener
+	MigrationChan chan *interpreter.Interpreter
+	MsgChan       chan *msgs.Msg
 }
 
 func NewServer(ipAddr, port string) *Server {
 	return &Server{
-		IpAddr:  ipAddr,
-		Port:    port,
-		EnvChan: make(chan *interpreter.Interpreter),
+		IpAddr:        ipAddr,
+		Port:          port,
+		MigrationChan: make(chan *interpreter.Interpreter),
+		MsgChan:       make(chan *msgs.Msg),
 	}
 }
 
@@ -49,30 +51,39 @@ func (s *Server) ListenAndAccept() error {
 		go s.HandleConn(conn)
 	}
 }
-func (s *Server) Migrate(ipAddr, port string, p *interpreter.Interpreter) error {
+func (s *Server) Migrate(ipAddr, port string, p *interpreter.Interpreter) (net.Conn, error) {
 	conn, err := net.Dial("tcp", ipAddr+port)
 	if err != nil {
 		fmt.Println(err)
-		return err
+		return nil, err
 	}
 	conn.Write([]byte{MigrationMsg})
 	if err := gob.NewEncoder(conn).Encode(p); err != nil {
-		return err
+		return nil, err
 	}
 	go s.HandleConn(conn)
-	return nil
+	return conn, nil
 }
 
 func (s *Server) HandleConn(conn net.Conn) error {
 	defer conn.Close()
-	b := make([]byte, 1)
+	var (
+		b   = make([]byte, 1)
+		err error
+	)
 	for {
 		conn.Read(b)
 		switch b[0] {
 		case MigrationMsg:
-			s.handleMigrationMsg(conn)
+			err = s.handleMigrationMsg(conn)
 		case SendMsg:
-			s.handleSndMsg(conn)
+			err = s.handleSndMsg(conn)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
 	}
 }
@@ -87,12 +98,23 @@ func (s *Server) handleMigrationMsg(conn net.Conn) error {
 	}
 	inter.MigratedFrom = conn.RemoteAddr().Network()
 	inter.Conn = conn
-	s.EnvChan <- inter
+	s.MigrationChan <- inter
 	return nil
 }
-
+func (s *Server) SendSndMsg(m *msgs.Msg) error {
+	m.Conn.Write([]byte{0x1})
+	msgForEncoding := msgs.MsgForEncoding{
+		GroupId: m.GroupId,
+		Val:     m.Val,
+		ChanId:  m.ChanId,
+		From:    m.From,
+	}
+	if err := gob.NewEncoder(m.Conn).Encode(msgForEncoding); err != nil {
+		return err
+	}
+	return nil
+}
 func (s *Server) handleSndMsg(conn net.Conn) error {
-	fmt.Println("Handling send msg")
 	msg := &msgs.Msg{}
 	if err := gob.NewDecoder(conn).Decode(msg); err != nil {
 		if errors.Is(err, io.EOF) {
@@ -100,6 +122,6 @@ func (s *Server) handleSndMsg(conn net.Conn) error {
 		}
 		fmt.Printf("Wrong: %s\n", err)
 	}
-	fmt.Println(msg)
+	s.MsgChan <- msg
 	return nil
 }
