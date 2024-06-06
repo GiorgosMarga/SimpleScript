@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GiorgosMarga/simplescript/msgs"
@@ -18,6 +18,8 @@ const (
 	Running = iota
 	Migrated
 	Killed
+	Finished
+	Error
 )
 
 const (
@@ -42,7 +44,7 @@ const (
 
 type Prog struct {
 	Name     string
-	Status   string
+	Status   int
 	killChan chan struct{}
 	ThreadId int
 	GroupId  int
@@ -58,28 +60,29 @@ type Interpreter struct {
 	SleepUntil   time.Time
 	MsgChan      chan *msgs.Msg
 	MigratedFrom string
-	Conn         net.Conn
 	threadsState map[int]int
+	ThreadsAddr  map[int]string
+	mtx          *sync.Mutex
 }
 
 func NewProg(name string, threadid int) *Prog {
 	return &Prog{
 		Name:     name,
-		Status:   "RUNNING",
+		Status:   Running,
 		ThreadId: threadid,
 		killChan: make(chan struct{}),
 	}
 }
 
-func (p *Prog) KillProg(status string) {
-	if p.Status != "RUNNING" {
+func (p *Prog) KillProg(status int) {
+	if p.Status != Running {
 		return
 	}
 	fmt.Printf("Sending termination signal to %s (%d)\n", p.Name, p.ThreadId)
 	p.killChan <- struct{}{}
 	p.Status = status
 }
-func NewInterpreter(p *Prog, groupChans map[int]chan msgs.InterProcessMsg, Ctr int, msgChan chan *msgs.Msg, threadsState map[int]int) *Interpreter {
+func NewInterpreter(p *Prog, groupChans map[int]chan msgs.InterProcessMsg, Ctr int, msgChan chan *msgs.Msg, threadsState map[int]int, threadsAddr map[int]string) *Interpreter {
 	return &Interpreter{
 		Ctr:          Ctr,
 		Variables:    make(map[string]string),
@@ -88,6 +91,8 @@ func NewInterpreter(p *Prog, groupChans map[int]chan msgs.InterProcessMsg, Ctr i
 		SleepUntil:   time.Now(),
 		MsgChan:      msgChan,
 		threadsState: threadsState,
+		ThreadsAddr:  threadsAddr,
+		mtx:          &sync.Mutex{},
 	}
 }
 
@@ -140,8 +145,6 @@ func (i *Interpreter) readLine() error {
 	line = bytes.TrimSpace(line)
 
 	tkns := bytes.Split(line, []byte{' '})
-	// fmt.Printf("[threadID: %d, ProgName: %s] > %s\n", i.ThreadId, i.ProgName, string(line))
-
 	switch {
 	case bytes.Equal(tkns[0], []byte(Set)):
 		i.Ctr++
@@ -174,6 +177,8 @@ func (i *Interpreter) readLine() error {
 }
 
 func (i *Interpreter) HandleRcv(tokens [][]byte) error {
+	i.mtx.Lock()
+	defer i.mtx.Unlock()
 	// Split in the correct way, so strings can contain spaces
 	jnd := bytes.Join(tokens, []byte{' '})
 	tokens = bytes.SplitN(jnd, []byte{' '}, 3)
@@ -205,13 +210,12 @@ func (i *Interpreter) HandleRcv(tokens [][]byte) error {
 		select {
 		case data := <-i.groupChans[id]:
 			i.Variables[val2] = string(data.Val)
-			if len(i.MigratedFrom) > 0 || i.threadsState[data.From] == Migrated {
+			if state, ok := i.threadsState[data.From]; !ok || state == Migrated {
 				m := &msgs.Msg{
 					ChanId:  data.From,
 					GroupId: i.Program.GroupId,
-					Conn:    i.Conn,
-					Val:     []byte{0x0},
 					From:    i.Program.ThreadId,
+					To:      i.ThreadsAddr[data.From],
 				}
 				// ack that received msg
 				i.MsgChan <- m
@@ -223,6 +227,8 @@ func (i *Interpreter) HandleRcv(tokens [][]byte) error {
 	}
 }
 func (i *Interpreter) HandleSnd(tokens [][]byte) error {
+	i.mtx.Lock()
+	defer i.mtx.Unlock()
 	// Split in the correct way, so strings can contain spaces
 	jnd := bytes.Join(tokens, []byte{' '})
 	tokens = bytes.SplitN(jnd, []byte{' '}, 3)
@@ -257,13 +263,13 @@ func (i *Interpreter) HandleSnd(tokens [][]byte) error {
 		}
 	}
 	id, _ := strconv.Atoi(val1)
-	if len(i.MigratedFrom) > 0 || i.threadsState[id] == Migrated {
+	if state, ok := i.threadsState[id]; !ok || state == Migrated {
 		m := &msgs.Msg{
 			ChanId:  id,
 			GroupId: i.Program.GroupId,
 			Val:     []byte(val2),
-			Conn:    i.Conn,
 			From:    i.Program.ThreadId,
+			To:      i.ThreadsAddr[id],
 		}
 		i.MsgChan <- m
 		// block here until other process rcv
@@ -553,6 +559,9 @@ func (i *Interpreter) HandleSet(tokens [][]byte) error {
 func (i *Interpreter) AddChan(groupChans map[int]chan msgs.InterProcessMsg) {
 	i.groupChans = groupChans
 }
+func (i *Interpreter) AddThreadsState(threadsState map[int]int) {
+	i.threadsState = threadsState
+}
 func (i *Interpreter) GetPos() int {
 	return i.Ctr
 }
@@ -580,4 +589,16 @@ func isVarValI(v []byte) bool {
 func isIntVal(v []byte) bool {
 	_, err := strconv.Atoi(string(v))
 	return err == nil
+}
+
+func (i *Interpreter) Lock() {
+	i.mtx.Lock()
+}
+
+func (i *Interpreter) Unlock() {
+	i.mtx.Unlock()
+}
+
+func (i *Interpreter) CreateMtx() {
+	i.mtx = &sync.Mutex{}
 }
