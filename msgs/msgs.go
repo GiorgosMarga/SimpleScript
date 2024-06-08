@@ -1,21 +1,10 @@
 package msgs
 
-import "net"
-
 type Msg struct {
 	From    int
 	ChanId  int
 	GroupId int
 	Val     []byte
-	To      string
-	Conn    net.Conn `gob:"-"`
-}
-
-type MsgForEncoding struct {
-	GroupId int
-	From    int
-	Val     []byte
-	ChanId  int
 	To      string
 }
 
@@ -31,4 +20,20 @@ type MigrationInfoMsg struct {
 type LoadBalanceMsg struct {
 	Val  int
 	From string
+}
+
+type NewConnectionMsg struct {
+	Address string
+	GroupId int
+}
+
+type KillGroupMsg struct {
+	GroupId int
+}
+type NewGroupMsg struct {
+	Groupid int
+}
+type MsgWrapper struct {
+	Type byte
+	Val  any
 }

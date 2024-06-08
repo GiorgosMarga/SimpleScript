@@ -1,13 +1,14 @@
 package server
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"strconv"
 	"strings"
 
 	"github.com/GiorgosMarga/simplescript/interpreter"
@@ -15,11 +16,14 @@ import (
 )
 
 func init() {
-	gob.Register(msgs.InterProcessMsg{})
-	gob.Register(msgs.LoadBalanceMsg{})
-	gob.Register(msgs.MsgForEncoding{})
-	gob.Register(msgs.MigrationInfoMsg{})
-	gob.Register(msgs.Msg{})
+	gob.Register(&msgs.MsgWrapper{})
+	gob.Register(&msgs.LoadBalanceMsg{})
+	gob.Register(&msgs.MigrationInfoMsg{})
+	gob.Register(&interpreter.Interpreter{})
+	gob.Register(&msgs.NewConnectionMsg{})
+	gob.Register(&msgs.KillGroupMsg{})
+	gob.Register(&msgs.NewGroupMsg{})
+	gob.Register(&msgs.Msg{})
 }
 
 // const StreamByte = byte(0)
@@ -28,6 +32,9 @@ const (
 	SendMsg        = 0x1
 	LoadBalanceMsg = 0x2
 	MigrateInfoMsg = 0x3
+	ConnectionMsg  = 0x4
+	KillMsg        = 0x5
+	NewGroupMsg    = 0x6
 )
 
 type Server struct {
@@ -66,38 +73,69 @@ func (s *Server) ListenAndAccept() error {
 		go s.HandleConn(conn, false)
 	}
 }
-func (s *Server) Migrate(ipAddr string, i *interpreter.Interpreter) (net.Conn, error) {
+
+func (s *Server) Migrate(ipAddr string, i *interpreter.Interpreter) error {
 	conn, ok := s.Peers[ipAddr]
 	if !ok {
 		fmt.Println("Peers isn't connected:", ipAddr)
-		return nil, fmt.Errorf("peer isn't connected: %s", ipAddr)
+		return fmt.Errorf("peer isn't connected: %s", ipAddr)
 	}
-	if _, err := conn.Write([]byte{MigrationMsg}); err != nil {
-		return nil, err
+	msg := msgs.MsgWrapper{
+		Type: MigrationMsg,
+		Val:  i,
 	}
-	if err := gob.NewEncoder(conn).Encode(i); err != nil {
-		return nil, err
-	}
-
-	infoMsg := msgs.MigrationInfoMsg{
+	s.sendMsg(msg, conn)
+	infoMsg := &msgs.MigrationInfoMsg{
 		GroupId:    i.Program.GroupId,
 		ThreadId:   i.Program.ThreadId,
 		MigratedTo: ipAddr,
 	}
-
+	msg = msgs.MsgWrapper{
+		Type: MigrateInfoMsg,
+		Val:  infoMsg,
+	}
 	for _, c := range s.Peers {
 		if c == conn {
 			continue
 		}
-		if _, err := c.Write([]byte{MigrateInfoMsg}); err != nil {
-			return nil, err
-		}
-		if err := gob.NewEncoder(c).Encode(infoMsg); err != nil {
-			return nil, err
-		}
+		s.sendMsg(msg, c)
+	}
+	return nil
+}
+
+func (s *Server) sendMsg(msg msgs.MsgWrapper, conn net.Conn) error {
+	buffer := new(bytes.Buffer)
+	if err := gob.NewEncoder(buffer).Encode(msg); err != nil {
+		fmt.Println(err)
+		return err
+	}
+	msgBytes := buffer.Bytes()
+	length := uint32(len(msgBytes))
+	if err := binary.Write(conn, binary.BigEndian, length); err != nil {
+		return err
+	}
+	_, err := conn.Write(msgBytes)
+	return err
+}
+func (s *Server) receiveMessage(conn net.Conn) (msgs.MsgWrapper, error) {
+	var length uint32
+	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+		return msgs.MsgWrapper{}, err
 	}
 
-	return conn, nil
+	msgBytes := make([]byte, length)
+	if _, err := conn.Read(msgBytes); err != nil {
+		return msgs.MsgWrapper{}, err
+	}
+
+	buffer := bytes.NewBuffer(msgBytes)
+	decoder := gob.NewDecoder(buffer)
+
+	var wrapper msgs.MsgWrapper
+	if err := decoder.Decode(&wrapper); err != nil {
+		return msgs.MsgWrapper{}, err
+	}
+	return wrapper, nil
 }
 
 func (s *Server) HandleConn(conn net.Conn, isInbound bool) error {
@@ -105,38 +143,52 @@ func (s *Server) HandleConn(conn net.Conn, isInbound bool) error {
 		fmt.Println("Conn closed")
 		conn.Close()
 	}()
-	var (
-		b   = make([]byte, 1)
-		err error
-	)
 
 	if !isInbound {
-		a := make([]byte, 1024)
-		n, err := conn.Read(a)
+		msg, err := s.receiveMessage(conn)
 		if err != nil {
-			fmt.Println(err)
-			return err
+			log.Fatal(err)
 		}
-		adrs := string(a[:n])
-		fmt.Printf("[%s] incoming connection from: (%s)\n", s.Address(), adrs)
-		s.Peers[adrs] = conn
+		if msg.Type != ConnectionMsg {
+			log.Fatalf("protocol error: received wrong message type: %d", msg.Type)
+		}
+		m := msg.Val.(*msgs.NewConnectionMsg)
+		fmt.Printf("[%s] incoming connection from: (%s)\n", s.Address(), m.Address)
+		s.Peers[m.Address] = conn
+		s.MsgChan <- m
 	} else {
-		if _, err := conn.Write([]byte(s.Address())); err != nil {
+		msg := msgs.MsgWrapper{
+			Val: &msgs.NewConnectionMsg{
+				Address: s.Address(),
+				GroupId: 0,
+			},
+			Type: ConnectionMsg,
+		}
+		if err := s.sendMsg(msg, conn); err != nil {
 			return err
 		}
 	}
-
 	for {
-		conn.Read(b)
-		switch b[0] {
+		msg, err := s.receiveMessage(conn)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			log.Fatal(err)
+		}
+		switch msg.Type {
 		case MigrationMsg:
-			err = s.handleMigrationMsg(conn)
+			err = s.handleMigrationMsg(msg.Val.(*interpreter.Interpreter))
 		case SendMsg:
-			err = s.handleSndMsg(conn)
+			err = s.handleSndMsg(msg.Val.(*msgs.Msg))
 		case LoadBalanceMsg:
-			err = s.handleLoadBalanceMsg(conn)
+			err = s.handleLoadBalanceMsg(msg.Val.(*msgs.LoadBalanceMsg))
 		case MigrateInfoMsg:
-			err = s.handleMigrateInfoMsg(conn)
+			err = s.handleMigrateInfoMsg(msg.Val.(*msgs.MigrationInfoMsg))
+		case KillMsg:
+			err = s.handleKillMsg(msg.Val.(*msgs.KillGroupMsg))
+		case NewGroupMsg:
+			err = s.handleNewGroupMsg(msg.Val.(*msgs.NewGroupMsg))
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -147,48 +199,52 @@ func (s *Server) HandleConn(conn net.Conn, isInbound bool) error {
 		}
 	}
 }
-func (s *Server) handleMigrateInfoMsg(conn net.Conn) error {
-	m := &msgs.MigrationInfoMsg{}
-	if err := gob.NewDecoder(conn).Decode(m); err != nil {
+func (s *Server) SendNewGroupMsg(grpid int) error {
+	msg := &msgs.NewGroupMsg{Groupid: grpid}
+	if err := s.broadcastMessage([]net.Conn{}, NewGroupMsg, msg); err != nil {
 		return err
 	}
-	s.MsgChan <- m
 	return nil
 }
-func (s *Server) handleMigrationMsg(conn net.Conn) error {
-	inter := &interpreter.Interpreter{}
-	if err := gob.NewDecoder(conn).Decode(inter); err != nil {
-		return err
-	}
-	inter.MigratedFrom = conn.RemoteAddr().Network()
-	s.MigrationChan <- inter
+func (s *Server) handleNewGroupMsg(msg *msgs.NewGroupMsg) error {
+	s.MsgChan <- msg
+	return nil
+}
+func (s *Server) handleMigrateInfoMsg(msg *msgs.MigrationInfoMsg) error {
+	s.MsgChan <- msg
+	return nil
+}
+func (s *Server) handleKillMsg(msg *msgs.KillGroupMsg) error {
+	s.MsgChan <- msg
+	return nil
+}
+func (s *Server) handleMigrationMsg(inter *interpreter.Interpreter) error {
+	s.MsgChan <- inter
 	return nil
 }
 func (s *Server) SendSndMsg(m *msgs.Msg) error {
-	var ok bool
-	m.Conn, ok = s.Peers[m.To]
+	conn, ok := s.Peers[m.To]
 	if !ok {
 		return nil
 	}
-	if _, err := m.Conn.Write([]byte{SendMsg}); err != nil {
-		return err
+	msg := msgs.MsgWrapper{
+		Type: SendMsg,
+		Val:  m,
 	}
-	msgForEncoding := msgs.MsgForEncoding{
-		GroupId: m.GroupId,
-		Val:     m.Val,
-		ChanId:  m.ChanId,
-		From:    m.From,
+	s.sendMsg(msg, conn)
+	return nil
+}
+
+func (s *Server) KillGroupMsg(grpid int) error {
+	msg := &msgs.KillGroupMsg{
+		GroupId: grpid,
 	}
-	if err := gob.NewEncoder(m.Conn).Encode(msgForEncoding); err != nil {
+	if err := s.broadcastMessage([]net.Conn{}, KillMsg, msg); err != nil {
 		return err
 	}
 	return nil
 }
-func (s *Server) handleSndMsg(conn net.Conn) error {
-	msg := &msgs.Msg{}
-	if err := gob.NewDecoder(conn).Decode(msg); err != nil {
-		return err
-	}
+func (s *Server) handleSndMsg(msg *msgs.Msg) error {
 	s.MsgChan <- msg
 	return nil
 }
@@ -210,35 +266,50 @@ func (s *Server) Connect(Peers string) error {
 	}
 	return nil
 }
-func (s *Server) LoadBalance(val int) {
-	temp := fmt.Sprintf("%d", val)
-	s.broadcastMessage(LoadBalanceMsg, []byte(temp))
-}
-func (s *Server) handleLoadBalanceMsg(conn net.Conn) error {
-	b := make([]byte, 1024)
-	n, err := conn.Read(b)
-	if err != nil {
-		return err
-	}
-	val, err := strconv.Atoi(string(b[:n]))
-	if err != nil {
-		return err
-	}
-	lbMsg := msgs.LoadBalanceMsg{
-		From: conn.RemoteAddr().String(),
+func (s *Server) LoadBalance(val int, ignore []net.Conn) error {
+	lbMsg := &msgs.LoadBalanceMsg{
 		Val:  val,
+		From: s.Address(),
 	}
-	s.MsgChan <- lbMsg
-	return nil
-}
-func (s *Server) broadcastMessage(msgB byte, msg []byte) error {
-	for _, p := range s.Peers {
-		p.Write([]byte{msgB})
-		p.Write(msg)
+	if err := s.broadcastMessage(ignore, LoadBalanceMsg, lbMsg); err != nil {
+		return err
 	}
 	return nil
 }
+func (s *Server) handleLoadBalanceMsg(msg *msgs.LoadBalanceMsg) error {
+	s.MsgChan <- msg
+	return nil
+}
+func (s *Server) broadcastMessage(ignore []net.Conn, msgB byte, msg any) error {
 
+	msgW := msgs.MsgWrapper{
+		Type: msgB,
+		Val:  msg,
+	}
+
+	for _, conn := range s.Peers {
+		if exists(conn, ignore) {
+			continue
+		}
+		s.sendMsg(msgW, conn)
+	}
+
+	return nil
+}
 func (s *Server) Address() string {
 	return s.IpAddr + s.Port
+}
+
+func exists(conn net.Conn, conns []net.Conn) bool {
+	for _, c := range conns {
+		if c == conn {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) IsConnected(addr string) bool {
+	_, ok := s.Peers[addr]
+	return ok
 }

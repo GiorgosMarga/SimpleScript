@@ -20,6 +20,7 @@ const (
 	Killed
 	Finished
 	Error
+	Idle
 )
 
 const (
@@ -65,22 +66,27 @@ type Interpreter struct {
 	mtx          *sync.Mutex
 }
 
-func NewProg(name string, threadid int) *Prog {
+func NewProg(name string, threadid, grpid int) *Prog {
 	return &Prog{
 		Name:     name,
-		Status:   Running,
 		ThreadId: threadid,
+		GroupId:  grpid,
+		Status:   Idle,
 		killChan: make(chan struct{}),
 	}
 }
 
-func (p *Prog) KillProg(status int) {
+func (p *Prog) KillProg(status int) error {
 	if p.Status != Running {
-		return
+		if p.Status == Idle {
+			return nil
+		}
+		return fmt.Errorf("process %s is not currently running: gid: %d\t tid:%d", p.Name, p.GroupId, p.ThreadId)
 	}
 	fmt.Printf("Sending termination signal to %s (%d)\n", p.Name, p.ThreadId)
 	p.killChan <- struct{}{}
 	p.Status = status
+	return nil
 }
 func NewInterpreter(p *Prog, groupChans map[int]chan msgs.InterProcessMsg, Ctr int, msgChan chan *msgs.Msg, threadsState map[int]int, threadsAddr map[int]string) *Interpreter {
 	return &Interpreter{
@@ -96,6 +102,12 @@ func NewInterpreter(p *Prog, groupChans map[int]chan msgs.InterProcessMsg, Ctr i
 	}
 }
 
+func (i *Interpreter) Update(groupchans map[int]chan msgs.InterProcessMsg, threadsState map[int]int) {
+	i.groupChans = groupchans
+	i.threadsState = threadsState
+	i.mtx = &sync.Mutex{}
+	i.Program.killChan = make(chan struct{})
+}
 func (i *Interpreter) ReadInstructions(f io.Reader, args []string) error {
 	instr, err := io.ReadAll(f)
 	if err != nil {
@@ -163,11 +175,16 @@ func (i *Interpreter) readLine() error {
 		i.Ctr++
 		return i.HandlePrint(tkns)
 	case bytes.Equal(tkns[0], []byte(Snd)):
+		if err := i.HandleSnd(tkns); err != nil {
+			return err
+		}
 		i.Ctr++
-		return i.HandleSnd(tkns)
+		return nil
 	case bytes.Equal(tkns[0], []byte(Rcv)):
+		if err := i.HandleRcv(tkns); err != nil {
+			return err
+		}
 		i.Ctr++
-		return i.HandleRcv(tkns)
 	case bytes.Equal(tkns[0], []byte(Ret)):
 		i.Ctr = i.NumOfInstr // for loop in run() stops
 	default:
@@ -177,8 +194,8 @@ func (i *Interpreter) readLine() error {
 }
 
 func (i *Interpreter) HandleRcv(tokens [][]byte) error {
-	i.mtx.Lock()
-	defer i.mtx.Unlock()
+	// i.mtx.Lock()
+	// defer i.mtx.Unlock()
 	// Split in the correct way, so strings can contain spaces
 	jnd := bytes.Join(tokens, []byte{' '})
 	tokens = bytes.SplitN(jnd, []byte{' '}, 3)
@@ -303,14 +320,16 @@ func (i *Interpreter) HandleSleep(tokens [][]byte) error {
 		sleepVal = val
 	}
 	d, _ := strconv.Atoi(sleepVal)
-	var timer *time.Timer
-	if time.Now().Before(i.SleepUntil) {
-		timer = time.NewTimer(time.Duration(time.Until(i.SleepUntil).Seconds()) * time.Second)
-		i.SleepUntil = time.Now().Add(time.Duration(time.Until(i.SleepUntil).Seconds()) * time.Second)
-	} else {
-		timer = time.NewTimer(time.Duration(d) * time.Second)
-		i.SleepUntil = time.Now().Add(time.Duration(d) * time.Second)
-	}
+	// TODO: FIX TIME
+	// var timer *time.Timer
+	// if time.Now().Before(i.SleepUntil) {
+	// 	timer = time.NewTimer(time.Duration(time.Until(i.SleepUntil).Seconds()) * time.Second)
+	// 	i.SleepUntil = time.Now().Add(time.Duration(time.Until(i.SleepUntil).Seconds()) * time.Second)
+	// } else {
+	// 	i.SleepUntil = time.Now().Add(time.Duration(d) * time.Second)
+	// }
+	timer := time.NewTimer(time.Duration(d) * time.Second)
+
 	for {
 		select {
 		case <-timer.C:
@@ -381,7 +400,7 @@ func (i *Interpreter) HandlePrint(tokens [][]byte) error {
 		strBldr.WriteString(str)
 		j += n
 	}
-	fmt.Printf("[threadID: %d, ProgName: %s] > %s\n", i.Program.ThreadId, i.Program.Name, strBldr.String())
+	fmt.Printf("[groupid: %d, threadID: %d, ProgName: %s] > %s\n", i.Program.GroupId, i.Program.ThreadId, i.Program.Name, strBldr.String())
 	return nil
 }
 func (i *Interpreter) HandleBranch(tokens [][]byte) error {
@@ -556,12 +575,6 @@ func (i *Interpreter) HandleSet(tokens [][]byte) error {
 	i.Variables[string(varName)] = string(varVal)
 	return nil
 }
-func (i *Interpreter) AddChan(groupChans map[int]chan msgs.InterProcessMsg) {
-	i.groupChans = groupChans
-}
-func (i *Interpreter) AddThreadsState(threadsState map[int]int) {
-	i.threadsState = threadsState
-}
 func (i *Interpreter) GetPos() int {
 	return i.Ctr
 }
@@ -597,8 +610,4 @@ func (i *Interpreter) Lock() {
 
 func (i *Interpreter) Unlock() {
 	i.mtx.Unlock()
-}
-
-func (i *Interpreter) CreateMtx() {
-	i.mtx = &sync.Mutex{}
 }
