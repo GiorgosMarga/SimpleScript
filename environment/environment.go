@@ -289,6 +289,10 @@ func (e *Environment) handleMsgs() error {
 				e.mtx.Lock()
 				e.groupsRunning[msg.Groupid] = make([]*interpreter.Interpreter, 0)
 				e.mtx.Unlock()
+			case *msgs.DisconnectMsg:
+				e.mtx.Lock()
+				delete(e.addressToNumThreads, msg.Address)
+				e.mtx.Unlock()
 			}
 		}
 	}
@@ -447,6 +451,7 @@ scanLoop:
 					ctr = (ctr + 1) % len(peers)
 				}
 			}
+			break scanLoop
 		default:
 			fmt.Println("Unknown command:", e.scanner.Text())
 		}

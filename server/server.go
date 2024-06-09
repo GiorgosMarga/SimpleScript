@@ -172,6 +172,9 @@ func (s *Server) HandleConn(conn net.Conn, isInbound bool) error {
 		msg, err := s.receiveMessage(conn)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				delete(s.Peers, s.getAddress(conn))
+				msg := &msgs.DisconnectMsg{Address: s.getAddress(conn)}
+				s.MsgChan <- msg
 				return nil
 			}
 			log.Fatal(err)
@@ -299,7 +302,14 @@ func (s *Server) broadcastMessage(ignore []net.Conn, msgB byte, msg any) error {
 func (s *Server) Address() string {
 	return s.IpAddr + s.Port
 }
-
+func (s *Server) getAddress(conn net.Conn) string {
+	for a, c := range s.Peers {
+		if c == conn {
+			return a
+		}
+	}
+	return ""
+}
 func exists(conn net.Conn, conns []net.Conn) bool {
 	for _, c := range conns {
 		if c == conn {

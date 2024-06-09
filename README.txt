@@ -57,4 +57,5 @@ To test sleep
 go run main.go
 run sleep.ss || sleep.ss
 go run main.go -p=":3001" -peers="127.0.0.0:3000"
+go run main.go -p=":3002" -peers="127.0.0.0:3000,127.0.0.0:3001"
 migrate 0 0 127.0.0.0 :3001

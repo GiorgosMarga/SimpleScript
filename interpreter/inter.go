@@ -324,15 +324,11 @@ func (i *Interpreter) HandleSleep(tokens [][]byte) error {
 		sleepVal = val
 	}
 	d, _ := strconv.Atoi(sleepVal)
-	// TODO: FIX TIME
 	var timer *time.Timer
 	if !i.SleepUntil.IsZero() {
 		t := i.SleepUntil
-		fmt.Println("Sleep until: ",time.Duration(time.Until(i.SleepUntil)))
-		fmt.Println("I sleep for:", time.Duration(time.Until(t)).Seconds())
 		timer = time.NewTimer(time.Duration(time.Until(t)))
 	} else {
-		fmt.Println("I sleep for:", time.Duration(d)*time.Second)
 		timer = time.NewTimer(time.Duration(d) * time.Second)
 		i.SleepUntil = time.Now().Add(time.Duration(d) * time.Second)
 	}

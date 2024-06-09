@@ -26,7 +26,9 @@ type NewConnectionMsg struct {
 	Address string
 	GroupId int
 }
-
+type DisconnectMsg struct {
+	Address string
+}
 type KillGroupMsg struct {
 	GroupId int
 }
