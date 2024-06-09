@@ -6,7 +6,7 @@ multiply.txt
 * Assumes <a> is >= 0, else terminates
 
 Example:
-run multiply.ss 5 15
+./main 
 run multiply.ss 5 15
 
 2) 
@@ -23,7 +23,10 @@ receiver.txt
 * This is repeated <cnt> times 
 
 Example for 3 iterations:
+./main
+./main -p=":3001" -peers="127.0.0.0:3000"
 run sender.ss 1 3 hello 5 || receiver.ss 1 3
+One process should automatically migrate to :3001
 
 3)
 ring.txt
@@ -35,14 +38,23 @@ ring.txt
 * The token makes <cnt> circles around the ring   
 
 Example for a ring of 3 threads and 5 iterations:
+go run main.go
+go run main.go -p=":3001" -peers="127.0.0.0:3000"
 run ring.ss 0 1 2 2 10 || ring.ss 1 2 0 2 10 || ring.ss 2 0 1 2 10
-migrate 73 0 127.0.0.0 :3001
+go run main.go -p=":3002" -peers="127.0.0.0:3000,127.0.0.0:3001"
+migrate 0 0 127.0.0.0 :3002
+
+
+
+To test shutdown
+go run main.go
+run ring.ss 0 1 2 2 10 || ring.ss 1 2 0 2 10 || ring.ss 2 0 1 2 10
+go run main.go -p=":3001" -peers="127.0.0.0:3000"
+shutdown
+
+
+To test sleep
+go run main.go
+run sleep.ss || sleep.ss
+go run main.go -p=":3001" -peers="127.0.0.0:3000"
 migrate 0 0 127.0.0.0 :3001
-
-4) 
-    run multiply_m.ss 10 20 || multiply_m.ss 10 20
-    migrate 0 0 127.0.0.0 :3002
-
-5)
-    run testRecvM.ss || testSndM.ss
-    migrate 0 0 127.0.0.0 :3002

@@ -18,7 +18,7 @@ import (
 	"github.com/GiorgosMarga/simplescript/server"
 )
 
-const MaxID = 100 // math.MaxInt
+const MaxID = 1 // math.MaxInt
 
 type Environment struct {
 	s                   *server.Server
@@ -35,6 +35,7 @@ type Environment struct {
 type GroupInfo struct {
 	groupChans   map[int]chan msgs.InterProcessMsg
 	threadsState map[int]int
+	threadsAddr  map[int]string
 }
 
 var stateToStatus = map[int]string{
@@ -216,13 +217,14 @@ func (e *Environment) handleMigrationMsg(inter *interpreter.Interpreter) error {
 		gi = &GroupInfo{
 			groupChans:   make(map[int]chan msgs.InterProcessMsg),
 			threadsState: make(map[int]int),
+			threadsAddr:  inter.ThreadsAddr,
 		}
 		e.groupInfos[inter.Program.GroupId] = gi
 	}
 	gi.groupChans[inter.Program.ThreadId] = make(chan msgs.InterProcessMsg)
 	gi.threadsState[inter.Program.ThreadId] = interpreter.Running
 	e.groupInfos[inter.Program.GroupId] = gi
-	inter.Update(gi.groupChans, gi.threadsState)
+	inter.Update(gi.groupChans, gi.threadsState, gi.threadsAddr)
 	inter.Program.Status = interpreter.Running
 	go func() {
 		if err := inter.Run(); err != nil {
@@ -260,7 +262,6 @@ func (e *Environment) handleMsgs() error {
 				if gi.threadsState[msg.ChanId] == interpreter.Migrated {
 					threads := e.groupsRunning[msg.GroupId]
 					msg.To = threads[msg.ChanId].ThreadsAddr[msg.ChanId]
-					fmt.Println("Redirecting message to", msg.To)
 					e.s.SendSndMsg(msg)
 					continue
 				}
@@ -304,6 +305,7 @@ func (e *Environment) migrate(addr string, inter *interpreter.Interpreter) error
 
 	// inter.Lock()
 	// defer inter.Unlock()
+
 	inter.ThreadsAddr[tid] = addr
 	inter.MigratedFrom = e.s.Address()
 	if err := inter.Program.KillProg(interpreter.Migrated); err != nil {
@@ -313,6 +315,7 @@ func (e *Environment) migrate(addr string, inter *interpreter.Interpreter) error
 		return err
 	}
 	e.groupInfos[gid].threadsState[tid] = interpreter.Migrated
+	// fmt.Println(e.groupInfos[gid].threadsState)
 	inter.Program.Status = interpreter.Migrated
 	e.numOfThreads--
 	return nil
@@ -343,10 +346,27 @@ scanLoop:
 				threadId = t[2]
 				ipAddr   = t[3]
 				port     = t[4]
+				group    []*interpreter.Interpreter
+				ok       bool
 			)
 			gid, _ := strconv.Atoi(grpID)
 			tid, _ := strconv.Atoi(threadId)
-			inter := e.groupsRunning[gid][tid]
+			if group, ok = e.groupsRunning[gid]; !ok {
+				fmt.Printf("group: (%d) doesn't exist\n", gid)
+				continue
+			}
+			var inter *interpreter.Interpreter
+			for i := 0; i < len(group); i++ {
+				if group[i].Program.ThreadId == tid {
+					inter = group[i]
+					break
+				}
+			}
+			if inter == nil {
+				fmt.Printf("process: (%d) doesn't exist\n", tid)
+				continue
+			}
+
 			fmt.Println("Starting migration....")
 			go func() {
 				if err := e.migrate(ipAddr+port, inter); err != nil {
@@ -367,6 +387,7 @@ scanLoop:
 		case t[0] == "kill":
 			if len(t) != 2 {
 				fmt.Println("kill <id>")
+				continue
 			}
 			id, err := strconv.Atoi(t[1])
 			if err != nil {
@@ -386,6 +407,7 @@ scanLoop:
 			}
 			fmt.Printf("Thread: [%d] doesn't exist or is not running\n", id)
 		case t[0] == "run":
+			fmt.Println("Running")
 			id := e.generateID()
 			if err := e.s.SendNewGroupMsg(id); err != nil {
 				fmt.Println(err)

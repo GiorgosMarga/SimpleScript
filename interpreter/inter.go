@@ -94,7 +94,6 @@ func NewInterpreter(p *Prog, groupChans map[int]chan msgs.InterProcessMsg, Ctr i
 		Variables:    make(map[string]string),
 		Program:      p,
 		groupChans:   groupChans,
-		SleepUntil:   time.Now(),
 		MsgChan:      msgChan,
 		threadsState: threadsState,
 		ThreadsAddr:  threadsAddr,
@@ -102,10 +101,11 @@ func NewInterpreter(p *Prog, groupChans map[int]chan msgs.InterProcessMsg, Ctr i
 	}
 }
 
-func (i *Interpreter) Update(groupchans map[int]chan msgs.InterProcessMsg, threadsState map[int]int) {
+func (i *Interpreter) Update(groupchans map[int]chan msgs.InterProcessMsg, threadsState map[int]int, threadsAddr map[int]string) {
 	i.groupChans = groupchans
 	i.threadsState = threadsState
 	i.mtx = &sync.Mutex{}
+	i.ThreadsAddr = threadsAddr
 	i.Program.killChan = make(chan struct{})
 }
 func (i *Interpreter) ReadInstructions(f io.Reader, args []string) error {
@@ -169,8 +169,11 @@ func (i *Interpreter) readLine() error {
 	case bytes.Equal(tkns[0], []byte(Bra)):
 		return i.HandleBranch(tkns)
 	case bytes.Equal(tkns[0], []byte(Slp)):
+		if err := i.HandleSleep(tkns); err != nil {
+			return err
+		}
 		i.Ctr++
-		return i.HandleSleep(tkns)
+		return nil
 	case bytes.Equal(tkns[0], []byte(Prn)):
 		i.Ctr++
 		return i.HandlePrint(tkns)
@@ -301,6 +304,7 @@ func (i *Interpreter) HandleSnd(tokens [][]byte) error {
 
 	return nil
 }
+
 func (i *Interpreter) HandleSleep(tokens [][]byte) error {
 	if len(tokens) != 2 {
 		return fmt.Errorf("%w line: %d: expected SLP ValVarI\nGot %s", ErrInvalidInstruction, i.Ctr, tokens)
@@ -321,18 +325,22 @@ func (i *Interpreter) HandleSleep(tokens [][]byte) error {
 	}
 	d, _ := strconv.Atoi(sleepVal)
 	// TODO: FIX TIME
-	// var timer *time.Timer
-	// if time.Now().Before(i.SleepUntil) {
-	// 	timer = time.NewTimer(time.Duration(time.Until(i.SleepUntil).Seconds()) * time.Second)
-	// 	i.SleepUntil = time.Now().Add(time.Duration(time.Until(i.SleepUntil).Seconds()) * time.Second)
-	// } else {
-	// 	i.SleepUntil = time.Now().Add(time.Duration(d) * time.Second)
-	// }
-	timer := time.NewTimer(time.Duration(d) * time.Second)
+	var timer *time.Timer
+	if !i.SleepUntil.IsZero() {
+		t := i.SleepUntil
+		fmt.Println("Sleep until: ",time.Duration(time.Until(i.SleepUntil)))
+		fmt.Println("I sleep for:", time.Duration(time.Until(t)).Seconds())
+		timer = time.NewTimer(time.Duration(time.Until(t)))
+	} else {
+		fmt.Println("I sleep for:", time.Duration(d)*time.Second)
+		timer = time.NewTimer(time.Duration(d) * time.Second)
+		i.SleepUntil = time.Now().Add(time.Duration(d) * time.Second)
+	}
 
 	for {
 		select {
 		case <-timer.C:
+			i.SleepUntil = time.Time{}
 			return nil
 		case <-i.Program.killChan:
 			return ErrSignalKilled
