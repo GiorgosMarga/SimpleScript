@@ -18,7 +18,7 @@ import (
 	"github.com/GiorgosMarga/simplescript/server"
 )
 
-const MaxID = 1 // math.MaxInt
+const MaxID = 100 // math.MaxInt
 
 type Environment struct {
 	s                   *server.Server
@@ -267,7 +267,6 @@ func (e *Environment) handleMsgs() error {
 				}
 				gi.groupChans[msg.ChanId] <- interMsg
 			case *msgs.LoadBalanceMsg:
-				// fmt.Printf("Load balance msg: %+v\n", msg)
 				e.addressToNumThreads[msg.From] += msg.Val
 			case *msgs.MigrationInfoMsg:
 				threads, ok := e.groupsRunning[msg.GroupId]
@@ -451,7 +450,6 @@ scanLoop:
 					ctr = (ctr + 1) % len(peers)
 				}
 			}
-			break scanLoop
 		default:
 			fmt.Println("Unknown command:", e.scanner.Text())
 		}

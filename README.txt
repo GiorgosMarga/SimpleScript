@@ -42,7 +42,7 @@ go run main.go
 go run main.go -p=":3001" -peers="127.0.0.0:3000"
 run ring.ss 0 1 2 2 10 || ring.ss 1 2 0 2 10 || ring.ss 2 0 1 2 10
 go run main.go -p=":3002" -peers="127.0.0.0:3000,127.0.0.0:3001"
-migrate 0 0 127.0.0.0 :3002
+migrate 0 0 127.0.0.0 :3001
 
 
 
@@ -58,4 +58,4 @@ go run main.go
 run sleep.ss || sleep.ss
 go run main.go -p=":3001" -peers="127.0.0.0:3000"
 go run main.go -p=":3002" -peers="127.0.0.0:3000,127.0.0.0:3001"
-migrate 0 0 127.0.0.0 :3001
+migrate 10 2 127.0.0.0 :3002
